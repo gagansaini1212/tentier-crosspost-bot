@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,7 @@ class DraftPost:
 
 DRAFTS: dict[str, DraftPost] = {}
 PENDING_CONNECT: dict[int, str] = {}
+RECENT_GROUP_WELCOMES: dict[int, float] = {}
 
 CONNECT_PROMPTS: dict[str, str] = {
     "telegram": (
@@ -290,7 +292,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     chat = update.effective_chat
     if chat.type in ("group", "supergroup"):
-        if context.args == ["true"]:
+        if context.args == ["true"] and (time.monotonic() - RECENT_GROUP_WELCOMES.get(chat.id, 0.0)) < 10.0:
             return
         await update.message.reply_text(
             group_welcome_text(chat.title, chat.id),
@@ -338,7 +340,16 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat or update.effective_chat.type != "private":
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type in ("group", "supergroup"):
+        await update.message.reply_text(
+            group_welcome_text(chat.title, chat.id),
+            reply_markup=group_welcome_markup(chat.id),
+        )
+        return
+    if chat.type != "private":
         return
     bot_username = await get_bot_username(context)
     await update.message.reply_text(
@@ -580,6 +591,21 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
     old_status = member_update.old_chat_member.status
     new_status = member_update.new_chat_member.status
     if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
+        RECENT_GROUP_WELCOMES[chat.id] = time.monotonic()
+        adder = member_update.from_user
+        if adder and not get_user_env(adder.id).get("TELEGRAM_CHANNEL_ID"):
+            ok, _ = save_user_platform(adder.id, "telegram", str(chat.id))
+            if ok:
+                try:
+                    await context.bot.send_message(
+                        chat_id=adder.id,
+                        text=(
+                            f"Connected group \"{chat.title or chat.id}\" ({chat.id}) "
+                            "as your Telegram target. Send any text or photo here to cross-post!"
+                        ),
+                    )
+                except Exception:
+                    pass
         await context.bot.send_message(
             chat_id=chat.id,
             text=group_welcome_text(chat.title, chat.id),
