@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import tempfile
@@ -24,6 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
+ACCOUNTS_PATH = BASE_DIR / "user_accounts.json"
 MEDIA_DIR = Path(tempfile.gettempdir()) / "telegram_crosspost_media"
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +39,65 @@ class DraftPost:
 
 
 DRAFTS: dict[str, DraftPost] = {}
+PENDING_CONNECT: dict[int, str] = {}
+
+CONNECT_PROMPTS: dict[str, str] = {
+    "telegram": (
+        "Telegram Channel:\n"
+        "Send your channel @username or numeric ID (e.g. @mychannel).\n"
+        "(Make sure this bot is added as Admin in your channel.)"
+    ),
+    "discord": (
+        "Discord:\n"
+        "Send your Discord Webhook URL (https://discord.com/api/webhooks/...)."
+    ),
+    "x": (
+        "X (Twitter):\n"
+        "Send your 4 X API credentials separated by | :\n"
+        "API_KEY | API_SECRET | ACCESS_TOKEN | ACCESS_TOKEN_SECRET"
+    ),
+    "bluesky": (
+        "Bluesky:\n"
+        "Send your handle and App Password separated by | :\n"
+        "yourhandle.bsky.social | xxxx-xxxx-xxxx-xxxx"
+    ),
+    "mastodon": (
+        "Mastodon:\n"
+        "Send your instance URL and access token separated by | :\n"
+        "https://mastodon.social | your_access_token"
+    ),
+    "linkedin": (
+        "LinkedIn:\n"
+        "Send your Access Token and Author URN separated by | :\n"
+        "ACCESS_TOKEN | urn:li:person:xxxx"
+    ),
+    "facebook": (
+        "Facebook Page:\n"
+        "Send your Page ID and Meta Access Token separated by | :\n"
+        "PAGE_ID | META_ACCESS_TOKEN"
+    ),
+    "instagram": (
+        "Instagram Business:\n"
+        "Send 4 values separated by | :\n"
+        "IG_USER_ID | META_ACCESS_TOKEN | CLOUDINARY_CLOUD_NAME | CLOUDINARY_UPLOAD_PRESET"
+    ),
+}
+
+PLATFORM_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "telegram": ("TELEGRAM_CHANNEL_ID",),
+    "discord": ("DISCORD_WEBHOOK_URL",),
+    "x": ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET"),
+    "bluesky": ("BLUESKY_HANDLE", "BLUESKY_APP_PASSWORD"),
+    "mastodon": ("MASTODON_BASE_URL", "MASTODON_ACCESS_TOKEN"),
+    "linkedin": ("LINKEDIN_ACCESS_TOKEN", "LINKEDIN_AUTHOR_URN"),
+    "facebook": ("FB_PAGE_ID", "META_ACCESS_TOKEN"),
+    "instagram": (
+        "IG_USER_ID",
+        "META_ACCESS_TOKEN",
+        "CLOUDINARY_CLOUD_NAME",
+        "CLOUDINARY_UPLOAD_PRESET",
+    ),
+}
 
 
 def load_env() -> dict[str, str]:
@@ -55,6 +116,108 @@ def load_env() -> dict[str, str]:
 def load_admin_ids(env: dict[str, str]) -> set[int]:
     raw = env.get("ADMIN_USER_IDS", "")
     return {int(p.strip()) for p in raw.split(",") if p.strip().isdigit()}
+
+
+def _load_all_accounts() -> dict[str, dict[str, str]]:
+    if not ACCOUNTS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(ACCOUNTS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_all_accounts(data: dict[str, dict[str, str]]) -> None:
+    ACCOUNTS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        os.chmod(ACCOUNTS_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def get_user_env(user_id: int) -> dict[str, str]:
+    """Return effective credentials for a user (their saved accounts, plus .env defaults for admins)."""
+    base_env = load_env()
+    admin_ids = load_admin_ids(base_env)
+    user_saved = _load_all_accounts().get(str(user_id), {})
+
+    if user_id in admin_ids:
+        merged = dict(base_env)
+        merged.update(user_saved)
+        return merged
+
+    return dict(user_saved)
+
+
+def save_user_platform(user_id: int, platform: str, raw_input: str) -> tuple[bool, str]:
+    """Parse and save credentials for a user's platform."""
+    keys = PLATFORM_ENV_KEYS.get(platform)
+    if not keys:
+        return False, "Unknown platform."
+
+    parts = [p.strip() for p in raw_input.split("|")]
+    if len(keys) == 1:
+        val = raw_input.strip()
+        if not val:
+            return False, "Value cannot be empty."
+        if platform == "discord" and not val.startswith(("http://", "https://")):
+            return False, "Discord webhook must start with https://"
+        values = [val]
+    else:
+        if len(parts) != len(keys) or any(not p for p in parts):
+            return (
+                False,
+                f"Expected {len(keys)} values separated by | .\n\n{CONNECT_PROMPTS[platform]}",
+            )
+        values = parts
+
+    all_accounts = _load_all_accounts()
+    user_cfg = all_accounts.setdefault(str(user_id), {})
+    for k, v in zip(keys, values):
+        user_cfg[k] = v
+    _save_all_accounts(all_accounts)
+    return True, f"Connected {platform.title()}! Send /platforms to view or send a post to publish."
+
+
+def remove_user_platform(user_id: int, platform: str) -> bool:
+    keys = PLATFORM_ENV_KEYS.get(platform)
+    if not keys:
+        return False
+    all_accounts = _load_all_accounts()
+    user_cfg = all_accounts.get(str(user_id), {})
+    removed = False
+    for k in keys:
+        if k in user_cfg:
+            del user_cfg[k]
+            removed = True
+    if removed:
+        _save_all_accounts(all_accounts)
+    return removed
+
+
+def connect_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Telegram Channel", callback_data="cfg:add:telegram"),
+                InlineKeyboardButton("Discord", callback_data="cfg:add:discord"),
+            ],
+            [
+                InlineKeyboardButton("X (Twitter)", callback_data="cfg:add:x"),
+                InlineKeyboardButton("Bluesky", callback_data="cfg:add:bluesky"),
+            ],
+            [
+                InlineKeyboardButton("Mastodon", callback_data="cfg:add:mastodon"),
+                InlineKeyboardButton("LinkedIn", callback_data="cfg:add:linkedin"),
+            ],
+            [
+                InlineKeyboardButton("Facebook Page", callback_data="cfg:add:facebook"),
+                InlineKeyboardButton("Instagram", callback_data="cfg:add:instagram"),
+            ],
+            [InlineKeyboardButton("Cancel", callback_data="cfg:cancel")],
+        ]
+    )
 
 
 def build_draft_keyboard(
@@ -85,24 +248,19 @@ def build_draft_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
-def is_authorized(user_id: int | None, admin_ids: set[int]) -> bool:
-    if not user_id:
-        return False
-    return user_id in admin_ids
-
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+    if not update.message or not update.effective_user:
         return
-    env = load_env()
-    configured = get_configured_platforms(env)
-    plist = ", ".join(configured.values()) if configured else "None configured yet"
+    user_env = get_user_env(update.effective_user.id)
+    configured = get_configured_platforms(user_env)
+    plist = ", ".join(configured.values()) if configured else "None yet"
     await update.message.reply_text(
         "Multi-Platform Cross-Poster Bot\n\n"
-        "Send me a photo with a caption (or a text message), choose your target "
-        "platforms, and tap Publish Now.\n\n"
-        f"Configured platforms: {plist}\n"
-        "Commands: /platforms, /myid"
+        "1. Use /connect to add your social media accounts.\n"
+        "2. Send any photo + caption (or text) here.\n"
+        "3. Select your platforms and tap Publish Now.\n\n"
+        f"Your connected platforms: {plist}\n"
+        "Commands: /connect, /disconnect, /platforms, /myid"
     )
 
 
@@ -113,18 +271,84 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
-async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
+async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
-    env = load_env()
-    configured = get_configured_platforms(env)
+    await update.message.reply_text(
+        "Choose a platform to connect to your account:",
+        reply_markup=connect_keyboard(),
+    )
+
+
+async def disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    all_accounts = _load_all_accounts()
+    user_cfg = all_accounts.get(str(user_id), {})
+    configured = get_configured_platforms(user_cfg)
+    if not configured:
+        await update.message.reply_text("You have no saved platforms to disconnect.")
+        return
+
+    rows = [
+        [InlineKeyboardButton(f"Disconnect {label}", callback_data=f"cfg:del:{key}")]
+        for key, label in configured.items()
+    ]
+    rows.append([InlineKeyboardButton("Cancel", callback_data="cfg:cancel")])
+    await update.message.reply_text(
+        "Tap a platform to disconnect:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    user_env = get_user_env(update.effective_user.id)
+    configured = get_configured_platforms(user_env)
     if not configured:
         await update.message.reply_text(
-            "No platforms configured yet. Add credentials in .env and restart."
+            "You haven't connected any platforms yet. Choose one below:",
+            reply_markup=connect_keyboard(),
         )
         return
     lines = [f"- {name}" for name in configured.values()]
-    await update.message.reply_text("Configured platforms:\n" + "\n".join(lines))
+    await update.message.reply_text(
+        "Your connected platforms:\n" + "\n".join(lines) + "\n\nUse /connect to add more."
+    )
+
+
+async def handle_cfg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    parts = query.data.split(":")
+    action = parts[1]
+
+    if action == "cancel":
+        PENDING_CONNECT.pop(user_id, None)
+        await query.answer("Cancelled")
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if action == "add":
+        platform = parts[2]
+        PENDING_CONNECT[user_id] = platform
+        await query.answer()
+        await query.edit_message_text(
+            CONNECT_PROMPTS[platform] + "\n\n(Send the details now, or /connect to cancel.)"
+        )
+        return
+
+    if action == "del":
+        platform = parts[2]
+        remove_user_platform(user_id, platform)
+        await query.answer("Disconnected")
+        await query.edit_message_text(f"Disconnected {platform.title()}.")
+        return
 
 
 async def handle_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -134,18 +358,19 @@ async def handle_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not msg or not user or not chat or chat.type != "private":
         return
 
-    env = load_env()
-    admin_ids = load_admin_ids(env)
-    if not is_authorized(user.id, admin_ids):
-        await msg.reply_text(
-            f"Unauthorized. Add your Telegram User ID ({user.id}) to ADMIN_USER_IDS in .env."
-        )
+    # If user is currently answering a /connect prompt
+    if user.id in PENDING_CONNECT and msg.text:
+        platform = PENDING_CONNECT.pop(user.id)
+        _, reply = save_user_platform(user.id, platform, msg.text)
+        await msg.reply_text(reply)
         return
 
-    configured = get_configured_platforms(env)
+    user_env = get_user_env(user.id)
+    configured = get_configured_platforms(user_env)
     if not configured:
         await msg.reply_text(
-            "No target platforms are configured in .env yet. Run /platforms for details."
+            "You haven't connected any social platforms yet. Tap a platform to connect:",
+            reply_markup=connect_keyboard(),
         )
         return
 
@@ -195,8 +420,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Not your draft.", show_alert=True)
         return
 
-    env = load_env()
-    configured = get_configured_platforms(env)
+    user_env = get_user_env(draft.user_id)
+    configured = get_configured_platforms(user_env)
 
     if action == "toggle":
         key = parts[3]
@@ -227,7 +452,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("Publishing to selected platforms...")
 
         results = await publish_all(
-            context.bot, env, draft.selected, draft.text, draft.image_path
+            context.bot, user_env, draft.selected, draft.text, draft.image_path
         )
         DRAFTS.pop(draft_id, None)
         if draft.image_path and draft.image_path.exists():
@@ -249,7 +474,10 @@ def main() -> None:
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("connect", connect_command))
+    app.add_handler(CommandHandler("disconnect", disconnect_command))
     app.add_handler(CommandHandler("platforms", platforms_command))
+    app.add_handler(CallbackQueryHandler(handle_cfg_callback, pattern="^cfg:"))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^cp:"))
     app.add_handler(
         MessageHandler(
@@ -258,7 +486,7 @@ def main() -> None:
         )
     )
 
-    logger.info("Multi-Platform Cross-Poster bot is running (polling)...")
+    logger.info("Multi-Platform Cross-Poster bot is running (public mode)...")
     app.run_polling()
 
 
