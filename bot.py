@@ -10,6 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -43,9 +44,9 @@ PENDING_CONNECT: dict[int, str] = {}
 
 CONNECT_PROMPTS: dict[str, str] = {
     "telegram": (
-        "Telegram Channel:\n"
-        "Send your channel @username or numeric ID (e.g. @mychannel).\n"
-        "(Make sure this bot is added as Admin in your channel.)"
+        "Telegram Channel / Group:\n"
+        "Send your channel @username or numeric channel/group ID (e.g. @mychannel or -1001234567890).\n"
+        "(Make sure this bot is added as Admin in your channel, or added to your group.)"
     ),
     "discord": (
         "Discord:\n"
@@ -196,28 +197,59 @@ def remove_user_platform(user_id: int, platform: str) -> bool:
     return removed
 
 
-def connect_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Telegram Channel", callback_data="cfg:add:telegram"),
-                InlineKeyboardButton("Discord", callback_data="cfg:add:discord"),
-            ],
-            [
-                InlineKeyboardButton("X (Twitter)", callback_data="cfg:add:x"),
-                InlineKeyboardButton("Bluesky", callback_data="cfg:add:bluesky"),
-            ],
-            [
-                InlineKeyboardButton("Mastodon", callback_data="cfg:add:mastodon"),
-                InlineKeyboardButton("LinkedIn", callback_data="cfg:add:linkedin"),
-            ],
-            [
-                InlineKeyboardButton("Facebook Page", callback_data="cfg:add:facebook"),
-                InlineKeyboardButton("Instagram", callback_data="cfg:add:instagram"),
-            ],
-            [InlineKeyboardButton("Cancel", callback_data="cfg:cancel")],
-        ]
+async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    if context.bot.username:
+        return context.bot.username
+    me = await context.bot.get_me()
+    return me.username or ""
+
+
+def add_to_group_button(bot_username: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        "Add Bot to Group",
+        url=f"https://t.me/{bot_username}?startgroup=true",
     )
+
+
+def group_welcome_markup(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Use this Group", callback_data=f"cfg:usegroup:{chat_id}")]]
+    )
+
+
+def group_welcome_text(chat_title: str | None, chat_id: int) -> str:
+    title = chat_title or "this group"
+    return (
+        f"Bot is ready in {title}!\n"
+        f"Group ID: {chat_id}\n\n"
+        f"Tap \"Use this Group\" below to set this group as your Telegram target, "
+        f"or send {chat_id} in DM via /connect."
+    )
+
+
+def connect_keyboard(bot_username: str | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("Telegram Channel / Group", callback_data="cfg:add:telegram"),
+            InlineKeyboardButton("Discord", callback_data="cfg:add:discord"),
+        ],
+        [
+            InlineKeyboardButton("X (Twitter)", callback_data="cfg:add:x"),
+            InlineKeyboardButton("Bluesky", callback_data="cfg:add:bluesky"),
+        ],
+        [
+            InlineKeyboardButton("Mastodon", callback_data="cfg:add:mastodon"),
+            InlineKeyboardButton("LinkedIn", callback_data="cfg:add:linkedin"),
+        ],
+        [
+            InlineKeyboardButton("Facebook Page", callback_data="cfg:add:facebook"),
+            InlineKeyboardButton("Instagram", callback_data="cfg:add:instagram"),
+        ],
+    ]
+    if bot_username:
+        rows.append([add_to_group_button(bot_username)])
+    rows.append([InlineKeyboardButton("Cancel", callback_data="cfg:cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_draft_keyboard(
@@ -241,7 +273,12 @@ def build_draft_keyboard(
 
     rows.append(
         [
-            InlineKeyboardButton("Publish Now", callback_data=f"cp:go:{draft_id}"),
+            InlineKeyboardButton("Post to All", callback_data=f"cp:all:{draft_id}"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("Publish Selected", callback_data=f"cp:go:{draft_id}"),
             InlineKeyboardButton("Cancel", callback_data=f"cp:cancel:{draft_id}"),
         ]
     )
@@ -249,18 +286,47 @@ def build_draft_keyboard(
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_user:
+    if not update.message or not update.effective_user or not update.effective_chat:
         return
+    chat = update.effective_chat
+    if chat.type in ("group", "supergroup"):
+        if context.args == ["true"]:
+            return
+        await update.message.reply_text(
+            group_welcome_text(chat.title, chat.id),
+            reply_markup=group_welcome_markup(chat.id),
+        )
+        return
+
     user_env = get_user_env(update.effective_user.id)
     configured = get_configured_platforms(user_env)
     plist = ", ".join(configured.values()) if configured else "None yet"
+    bot_username = await get_bot_username(context)
+    buttons = [[InlineKeyboardButton("Connect Platforms", callback_data="cfg:menu")]]
+    if bot_username:
+        buttons.append([add_to_group_button(bot_username)])
+
     await update.message.reply_text(
         "Multi-Platform Cross-Poster Bot\n\n"
         "1. Use /connect to add your social media accounts.\n"
         "2. Send any photo + caption (or text) here.\n"
         "3. Select your platforms and tap Publish Now.\n\n"
         f"Your connected platforms: {plist}\n"
-        "Commands: /connect, /disconnect, /platforms, /myid"
+        "Commands: /connect, /disconnect, /platforms, /addgroup, /myid",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def addgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    bot_username = await get_bot_username(context)
+    if not bot_username:
+        await update.message.reply_text("Could not determine bot username.")
+        return
+    await update.message.reply_text(
+        "Tap below to add this bot directly to one of your Telegram groups:",
+        reply_markup=InlineKeyboardMarkup([[add_to_group_button(bot_username)]]),
     )
 
 
@@ -274,9 +340,10 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or update.effective_chat.type != "private":
         return
+    bot_username = await get_bot_username(context)
     await update.message.reply_text(
         "Choose a platform to connect to your account:",
-        reply_markup=connect_keyboard(),
+        reply_markup=connect_keyboard(bot_username),
     )
 
 
@@ -307,15 +374,22 @@ async def platforms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     user_env = get_user_env(update.effective_user.id)
     configured = get_configured_platforms(user_env)
+    bot_username = await get_bot_username(context)
     if not configured:
         await update.message.reply_text(
             "You haven't connected any platforms yet. Choose one below:",
-            reply_markup=connect_keyboard(),
+            reply_markup=connect_keyboard(bot_username),
         )
         return
     lines = [f"- {name}" for name in configured.values()]
+    markup = (
+        InlineKeyboardMarkup([[add_to_group_button(bot_username)]])
+        if bot_username
+        else None
+    )
     await update.message.reply_text(
-        "Your connected platforms:\n" + "\n".join(lines) + "\n\nUse /connect to add more."
+        "Your connected platforms:\n" + "\n".join(lines) + "\n\nUse /connect to add more.",
+        reply_markup=markup,
     )
 
 
@@ -328,6 +402,15 @@ async def handle_cfg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     parts = query.data.split(":")
     action = parts[1]
 
+    if action == "menu":
+        bot_username = await get_bot_username(context)
+        await query.answer()
+        await query.edit_message_text(
+            "Choose a platform to connect to your account:",
+            reply_markup=connect_keyboard(bot_username),
+        )
+        return
+
     if action == "cancel":
         PENDING_CONNECT.pop(user_id, None)
         await query.answer("Cancelled")
@@ -338,8 +421,23 @@ async def handle_cfg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         platform = parts[2]
         PENDING_CONNECT[user_id] = platform
         await query.answer()
+        markup = None
+        if platform == "telegram":
+            bot_username = await get_bot_username(context)
+            if bot_username:
+                markup = InlineKeyboardMarkup([[add_to_group_button(bot_username)]])
         await query.edit_message_text(
-            CONNECT_PROMPTS[platform] + "\n\n(Send the details now, or /connect to cancel.)"
+            CONNECT_PROMPTS[platform] + "\n\n(Send the details now, or /connect to cancel.)",
+            reply_markup=markup,
+        )
+        return
+
+    if action == "usegroup":
+        chat_id = parts[2]
+        ok, reply = save_user_platform(user_id, "telegram", chat_id)
+        await query.answer(
+            "This group is now connected to your account!" if ok else reply,
+            show_alert=True,
         )
         return
 
@@ -368,9 +466,10 @@ async def handle_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_env = get_user_env(user.id)
     configured = get_configured_platforms(user_env)
     if not configured:
+        bot_username = await get_bot_username(context)
         await msg.reply_text(
             "You haven't connected any social platforms yet. Tap a platform to connect:",
-            reply_markup=connect_keyboard(),
+            reply_markup=connect_keyboard(bot_username),
         )
         return
 
@@ -443,16 +542,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("Cross-post cancelled.")
         return
 
-    if action == "go":
-        if not draft.selected:
+    if action in ("go", "all"):
+        targets = set(configured.keys()) if action == "all" else draft.selected
+        if not targets:
             await query.answer("Select at least one platform!", show_alert=True)
             return
 
+        status_msg = (
+            "Publishing to all connected platforms..."
+            if action == "all"
+            else "Publishing to selected platforms..."
+        )
         await query.answer("Publishing...")
-        await query.edit_message_text("Publishing to selected platforms...")
+        await query.edit_message_text(status_msg)
 
         results = await publish_all(
-            context.bot, user_env, draft.selected, draft.text, draft.image_path
+            context.bot, user_env, targets, draft.text, draft.image_path
         )
         DRAFTS.pop(draft_id, None)
         if draft.image_path and draft.image_path.exists():
@@ -465,6 +570,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("Publish Report:\n\n" + "\n".join(lines))
 
 
+async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    member_update = update.my_chat_member
+    if not member_update:
+        return
+    chat = member_update.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    old_status = member_update.old_chat_member.status
+    new_status = member_update.new_chat_member.status
+    if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=group_welcome_text(chat.title, chat.id),
+            reply_markup=group_welcome_markup(chat.id),
+        )
+
+
 def main() -> None:
     env = load_env()
     token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -474,11 +596,13 @@ def main() -> None:
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("addgroup", addgroup_command))
     app.add_handler(CommandHandler("connect", connect_command))
     app.add_handler(CommandHandler("disconnect", disconnect_command))
     app.add_handler(CommandHandler("platforms", platforms_command))
     app.add_handler(CallbackQueryHandler(handle_cfg_callback, pattern="^cfg:"))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^cp:"))
+    app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & (filters.PHOTO | (filters.TEXT & ~filters.COMMAND)),
