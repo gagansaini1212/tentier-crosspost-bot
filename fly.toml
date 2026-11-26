@@ -1,6 +1,7 @@
 primary_region = "sin"
 
 [build]
+  dockerfile = "Dockerfile"
 
 [env]
   ACCOUNTS_PATH = "/data/user_accounts.json"
