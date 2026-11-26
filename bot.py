@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
-ACCOUNTS_PATH = BASE_DIR / "user_accounts.json"
+ACCOUNTS_PATH = Path(os.environ.get("ACCOUNTS_PATH", str(BASE_DIR / "user_accounts.json")))
 MEDIA_DIR = Path(tempfile.gettempdir()) / "telegram_crosspost_media"
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -132,6 +132,7 @@ def _load_all_accounts() -> dict[str, dict[str, str]]:
 
 
 def _save_all_accounts(data: dict[str, dict[str, str]]) -> None:
+    ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     ACCOUNTS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     try:
         os.chmod(ACCOUNTS_PATH, 0o600)

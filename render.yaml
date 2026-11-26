@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: telegram-crosspost-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ACCOUNTS_PATH
+        value: /data/user_accounts.json
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false

@@ -1,0 +1,6 @@
+.venv/
+.env
+user_accounts.json
+__pycache__/
+*.pyc
+.git/
