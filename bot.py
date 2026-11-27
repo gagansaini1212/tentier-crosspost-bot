@@ -7,8 +7,10 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CallbackQueryHandler,
     ChatMemberHandler,
@@ -38,6 +40,7 @@ class DraftPost:
     text: str
     image_path: Path | None
     selected: set[str]
+    image_file_id: str | None = None
 
 
 DRAFTS: dict[str, DraftPost] = {}
@@ -121,7 +124,40 @@ def load_admin_ids(env: dict[str, str]) -> set[int]:
     return {int(p.strip()) for p in raw.split(",") if p.strip().isdigit()}
 
 
+def _upstash_config() -> tuple[str, str] | None:
+    env = load_env()
+    url = env.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+    token = env.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+    if url and token:
+        return url, token
+    return None
+
+
+def _redis_cmd(*args: str | int):
+    cfg = _upstash_config()
+    if not cfg:
+        return None
+    url, token = cfg
+    resp = httpx.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        json=list(args),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json().get("result")
+
+
 def _load_all_accounts() -> dict[str, dict[str, str]]:
+    if _upstash_config():
+        try:
+            raw = _redis_cmd("GET", "crosspost:accounts")
+            if not raw:
+                return {}
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
     if not ACCOUNTS_PATH.exists():
         return {}
     try:
@@ -132,12 +168,80 @@ def _load_all_accounts() -> dict[str, dict[str, str]]:
 
 
 def _save_all_accounts(data: dict[str, dict[str, str]]) -> None:
+    if _upstash_config():
+        _redis_cmd("SET", "crosspost:accounts", json.dumps(data))
+        return
     ACCOUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     ACCOUNTS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     try:
         os.chmod(ACCOUNTS_PATH, 0o600)
     except OSError:
         pass
+
+
+def get_pending_connect(user_id: int) -> str | None:
+    if _upstash_config():
+        val = _redis_cmd("GET", f"crosspost:pending:{user_id}")
+        return str(val) if val else None
+    return PENDING_CONNECT.get(user_id)
+
+
+def set_pending_connect(user_id: int, platform: str) -> None:
+    if _upstash_config():
+        _redis_cmd("SET", f"crosspost:pending:{user_id}", platform, "EX", 3600)
+        return
+    PENDING_CONNECT[user_id] = platform
+
+
+def pop_pending_connect(user_id: int) -> str | None:
+    if _upstash_config():
+        key = f"crosspost:pending:{user_id}"
+        val = _redis_cmd("GET", key)
+        if val:
+            _redis_cmd("DEL", key)
+            return str(val)
+        return None
+    return PENDING_CONNECT.pop(user_id, None)
+
+
+def save_draft(draft_id: str, draft: DraftPost) -> None:
+    if _upstash_config():
+        payload = {
+            "user_id": draft.user_id,
+            "text": draft.text,
+            "image_file_id": draft.image_file_id,
+            "selected": sorted(draft.selected),
+        }
+        _redis_cmd("SET", f"crosspost:draft:{draft_id}", json.dumps(payload), "EX", 86400)
+        return
+    DRAFTS[draft_id] = draft
+
+
+def get_draft(draft_id: str) -> DraftPost | None:
+    if _upstash_config():
+        raw = _redis_cmd("GET", f"crosspost:draft:{draft_id}")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return DraftPost(
+                user_id=int(data["user_id"]),
+                text=str(data.get("text", "")),
+                image_path=None,
+                selected=set(data.get("selected", [])),
+                image_file_id=data.get("image_file_id"),
+            )
+        except Exception:
+            return None
+    return DRAFTS.get(draft_id)
+
+
+def delete_draft(draft_id: str) -> DraftPost | None:
+    if _upstash_config():
+        draft = get_draft(draft_id)
+        _redis_cmd("DEL", f"crosspost:draft:{draft_id}")
+        return draft
+    return DRAFTS.pop(draft_id, None)
 
 
 def get_user_env(user_id: int) -> dict[str, str]:
@@ -424,14 +528,14 @@ async def handle_cfg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if action == "cancel":
-        PENDING_CONNECT.pop(user_id, None)
+        pop_pending_connect(user_id)
         await query.answer("Cancelled")
         await query.edit_message_text("Cancelled.")
         return
 
     if action == "add":
         platform = parts[2]
-        PENDING_CONNECT[user_id] = platform
+        set_pending_connect(user_id, platform)
         await query.answer()
         markup = None
         if platform == "telegram":
@@ -469,11 +573,12 @@ async def handle_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # If user is currently answering a /connect prompt
-    if user.id in PENDING_CONNECT and msg.text:
-        platform = PENDING_CONNECT.pop(user.id)
-        _, reply = save_user_platform(user.id, platform, msg.text)
-        await msg.reply_text(reply)
-        return
+    if msg.text:
+        pending_platform = pop_pending_connect(user.id)
+        if pending_platform:
+            _, reply = save_user_platform(user.id, pending_platform, msg.text)
+            await msg.reply_text(reply)
+            return
 
     user_env = get_user_env(user.id)
     configured = get_configured_platforms(user_env)
@@ -486,27 +591,26 @@ async def handle_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     text = (msg.caption or msg.text or "").strip()
-    image_path: Path | None = None
-    if msg.photo:
-        photo = msg.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-        image_path = MEDIA_DIR / f"{uuid.uuid4().hex}.jpg"
-        await tg_file.download_to_drive(custom_path=image_path)
+    image_file_id = msg.photo[-1].file_id if msg.photo else None
 
-    if not text and not image_path:
+    if not text and not image_file_id:
         return
 
     draft_id = uuid.uuid4().hex[:8]
     selected = set(configured.keys())
-    DRAFTS[draft_id] = DraftPost(
-        user_id=user.id,
-        text=text,
-        image_path=image_path,
-        selected=selected,
+    save_draft(
+        draft_id,
+        DraftPost(
+            user_id=user.id,
+            text=text,
+            image_path=None,
+            selected=selected,
+            image_file_id=image_file_id,
+        ),
     )
 
     preview = text[:120] + ("..." if len(text) > 120 else "")
-    kind = "Image + Caption" if image_path else "Text"
+    kind = "Image + Caption" if image_file_id else "Text"
     await msg.reply_text(
         f"Ready to cross-post ({kind}):\n\"{preview}\"\n\nSelect platforms:",
         reply_markup=build_draft_keyboard(draft_id, configured, selected),
@@ -521,7 +625,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     parts = query.data.split(":")
     action = parts[1]
     draft_id = parts[2]
-    draft = DRAFTS.get(draft_id)
+    draft = get_draft(draft_id)
 
     if not draft:
         await query.answer("Draft expired.", show_alert=True)
@@ -540,6 +644,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             draft.selected.remove(key)
         else:
             draft.selected.add(key)
+        save_draft(draft_id, draft)
         await query.answer()
         await query.edit_message_reply_markup(
             reply_markup=build_draft_keyboard(draft_id, configured, draft.selected)
@@ -547,7 +652,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if action == "cancel":
-        DRAFTS.pop(draft_id, None)
+        delete_draft(draft_id)
         if draft.image_path and draft.image_path.exists():
             draft.image_path.unlink(missing_ok=True)
         await query.answer("Cancelled")
@@ -568,12 +673,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Publishing...")
         await query.edit_message_text(status_msg)
 
+        image_path = draft.image_path
+        if not image_path and draft.image_file_id:
+            tg_file = await context.bot.get_file(draft.image_file_id)
+            image_path = MEDIA_DIR / f"{uuid.uuid4().hex}.jpg"
+            await tg_file.download_to_drive(custom_path=image_path)
+
         results = await publish_all(
-            context.bot, user_env, targets, draft.text, draft.image_path
+            context.bot, user_env, targets, draft.text, image_path
         )
-        DRAFTS.pop(draft_id, None)
-        if draft.image_path and draft.image_path.exists():
-            draft.image_path.unlink(missing_ok=True)
+        delete_draft(draft_id)
+        if image_path and image_path.exists():
+            image_path.unlink(missing_ok=True)
 
         lines = [
             f"{'OK' if r.ok else 'FAILED'} — {r.platform}: {r.detail}"
@@ -614,13 +725,11 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
-def main() -> None:
-    env = load_env()
-    token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
-
-    app = ApplicationBuilder().token(token).build()
+def build_application(token: str, *, webhook: bool = False) -> Application:
+    builder = ApplicationBuilder().token(token)
+    if webhook:
+        builder = builder.updater(None)
+    app = builder.build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CommandHandler("addgroup", addgroup_command))
@@ -636,7 +745,16 @@ def main() -> None:
             handle_post_input,
         )
     )
+    return app
 
+
+def main() -> None:
+    env = load_env()
+    token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+
+    app = build_application(token, webhook=False)
     logger.info("Multi-Platform Cross-Poster bot is running (public mode)...")
     app.run_polling()
 
